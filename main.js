@@ -407,19 +407,35 @@ const TEX_MATRICES = { '(': 'pmatrix', '[': 'bmatrix', '|': 'vmatrix', '∣': 'v
 // Operators that take limits, so under/over scripts on them are written as _ and ^.
 const TEX_LIMIT_BASE = /^\\(?:sum|prod|coprod|int|iint|oint|bigcup|bigcap|lim|limsup|liminf|max|min|sup|inf|det|operatorname\{[^{}]*\})$/;
 
+// Clipboard markup is untrusted. Bound parsing before recursive conversion.
+const MAX_CLIPBOARD_HTML_LENGTH = 2 * 1024 * 1024;
+const MAX_MATHML_LENGTH = 256 * 1024;
+const MAX_MATHML_NODES = 8192;
+const MAX_MATHML_DEPTH = 128;
+const MAX_MATH_FORMULAS = 512;
+const MAX_TOTAL_MATHML_LENGTH = 512 * 1024;
+
 function parseMathml(mathml) {
+    if (mathml.length > MAX_MATHML_LENGTH) throw new Error('MathML size limit exceeded');
     const decode = (s) => s.replace(/&(?:#(\d+)|#x([\da-f]+)|(\w+));/gi, (m, dec, hex, name) =>
         dec ? String.fromCodePoint(+dec) : hex ? String.fromCodePoint(parseInt(hex, 16))
             : ({ lt: '<', gt: '>', amp: '&', quot: '"', apos: "'", nbsp: '\u00a0' })[name.toLowerCase()] ?? m);
     const root = { name: '', attrs: '', kids: [] }, stack = [root];
-    for (const m of mathml.matchAll(/<(\/?)([\w:-]+)([^>]*?)(\/?)>|([^<]+)/g)) {
+    let nodeCount = 0;
+    // A new '<' ends a malformed tag candidate; attributes must follow whitespace.
+    // Otherwise missing '>' delimiters can trigger quadratic regex backtracking.
+    for (const m of mathml.matchAll(/<(\/?)([\w:-]+)(\s[^<>]*?)?(\/?)>|([^<]+)/g)) {
+        if (!m[1] && ++nodeCount > MAX_MATHML_NODES) throw new Error('MathML node limit exceeded');
         const top = stack[stack.length - 1];
         if (m[5] !== undefined) top.kids.push(decode(m[5]));
         else if (m[1]) { if (stack.length > 1) stack.pop(); }
         else {
-            const node = { name: m[2].toLowerCase(), attrs: m[3], kids: [] };
+            const node = { name: m[2].toLowerCase(), attrs: m[3] || '', kids: [] };
             top.kids.push(node);
-            if (!m[4]) stack.push(node);
+            if (!m[4]) {
+                if (stack.length > MAX_MATHML_DEPTH) throw new Error('MathML depth limit exceeded');
+                stack.push(node);
+            }
         }
     }
     return root;
@@ -428,6 +444,9 @@ function parseMathml(mathml) {
 // Rebuilds TeX from presentation MathML, the only copy of a formula's structure Chrome puts
 // on the clipboard (KaTeX's <annotation> holding the source is dropped).
 function mathmlToTex(mathml) {
+    // row/table helpers revisit nodes for context-sensitive formatting. Reuse
+    // subtree conversions so those revisits cannot multiply with nesting depth.
+    const convertedNodes = new WeakMap();
     const attr = (n, k) => (n.attrs.match(new RegExp('\\b' + k + '\\s*=\\s*["\']([^"\']*)')) || [])[1];
     const text = (n) => n.kids.filter((k) => typeof k === 'string').join('');
     const elems = (n) => n.kids.filter((k) => typeof k !== 'string');
@@ -477,6 +496,13 @@ function mathmlToTex(mathml) {
 
     function conv(n) {
         if (typeof n === 'string') return '';
+        if (convertedNodes.has(n)) return convertedNodes.get(n);
+        const result = convertNode(n);
+        convertedNodes.set(n, result);
+        return result;
+    }
+
+    function convertNode(n) {
         const k = elems(n), c = k.map(conv);
         switch (n.name) {
             case 'mi': case 'mn': case 'mo':
@@ -529,23 +555,49 @@ function mathmlToTex(mathml) {
 // KaTeX pairs each formula's MathML with a drawn copy that pastes as garbled text, so drop
 // the drawing and write the MathML out as $tex$ (or a $$tex$$ block).
 function convertRenderedMath(html) {
-    let out = '', from = 0, m;
-    const drawing = /<span\b[^>]*\bclass="katex-html"[^>]*>/gi;
-    while ((m = drawing.exec(html))) {
-        out += html.slice(from, m.index);
-        const tag = /<(\/?)span\b[^>]*>/gi;
-        tag.lastIndex = drawing.lastIndex;
-        let depth = 1, t;
-        while (depth && (t = tag.exec(html))) depth += t[1] ? -1 : 1;
-        from = drawing.lastIndex = t ? tag.lastIndex : html.length;
+    if (html.length > MAX_CLIPBOARD_HTML_LENGTH) throw new Error('Clipboard HTML size limit exceeded');
+    // Scan each span once. Missing delimiters must not restart a suffix search
+    // for every candidate opening tag in malformed clipboard markup.
+    const spans = /<(\/?)span\b([^<>]*)>/gi;
+    const pieces = [];
+    let from = 0, depth = 0, m;
+    while ((m = spans.exec(html))) {
+        if (depth) {
+            depth += m[1] ? -1 : 1;
+            if (!depth) from = spans.lastIndex;
+        } else if (!m[1] && /\bclass="katex-html"/i.test(m[2])) {
+            pieces.push(html.slice(from, m.index));
+            depth = 1;
+        }
     }
-    html = out + html.slice(from);
+    if (!depth) pieces.push(html.slice(from));
+    html = pieces.join('');
 
-    return html.replace(/<math\b([^>]*)>([\s\S]*?)<\/math>/gi, (match, attrs, body) => {
+    const mathTags = /<(\/?)math\b([^<>]*)>/gi;
+    const result = [];
+    let opening = null;
+    from = 0;
+    let formulaCount = 0, totalMathLength = 0;
+    while ((m = mathTags.exec(html))) {
+        if (!m[1]) {
+            if (!opening) opening = { index: m.index, end: mathTags.lastIndex, attrs: m[2] };
+            continue;
+        }
+        if (!opening) continue;
+        const body = html.slice(opening.end, m.index);
+        totalMathLength += body.length;
+        if (++formulaCount > MAX_MATH_FORMULAS || totalMathLength > MAX_TOTAL_MATHML_LENGTH) {
+            throw new Error('Clipboard MathML work limit exceeded');
+        }
         const tex = mathmlToTex(body).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        if (!tex) return '';
-        return /\bdisplay\s*=\s*["']block/i.test(attrs) ? '<div>$$' + tex + '$$</div>' : '$' + tex + '$';
-    });
+        result.push(html.slice(from, opening.index));
+        if (tex) result.push(/\bdisplay\s*=\s*["']block/i.test(opening.attrs) ? '<div>$$' + tex + '$$</div>' : '$' + tex + '$');
+        from = mathTags.lastIndex;
+        opening = null;
+    }
+    if (opening) throw new Error('Incomplete MathML element');
+    result.push(html.slice(from));
+    return result.join('');
 }
 
 // Desktop only: the system clipboard, which a paste-as-plain-text event does not expose.
@@ -917,12 +969,16 @@ module.exports = class CleanAIPastePlugin extends Plugin {
 
                     let result = plainText;
                     if (!rawOnly) {
-                        const converted = resolveRawText(htmlToMarkdown(preprocessHtml(html, plainText)), plainText);
-                        if (converted !== plainText) {
-                            let structured = unwrapCodeFences(unescapeLinkParens(converted));
-                            structured = condenseBlankLines(structured, this.settings.condenseMode);
-                            structured = formatBlockquotePadding(formatTablePadding(structured));
-                            result = stripTrailingWhitespaces(structured).trim();
+                        try {
+                            const converted = resolveRawText(htmlToMarkdown(preprocessHtml(html, plainText)), plainText);
+                            if (converted !== plainText) {
+                                let structured = unwrapCodeFences(unescapeLinkParens(converted));
+                                structured = condenseBlankLines(structured, this.settings.condenseMode);
+                                structured = formatBlockquotePadding(formatTablePadding(structured));
+                                result = stripTrailingWhitespaces(structured).trim();
+                            }
+                        } catch (formatError) {
+                            console.error('Clean AI Paste Local: formatting failed, using plain text', formatError);
                         }
                     }
 
@@ -1516,14 +1572,8 @@ class CleanAIPasteSettingTab extends PluginSettingTab {
             }
         });
 
-        kofiLink.createEl('img', {
-            attr: {
-                src: 'https://storage.ko-fi.com/cdn/kofi2.png?v=6',
-                alt: 'Buy Me a Coffee at ko-fi.com',
-                height: '36',
-                style: 'border:0px;height:36px;'
-            }
-        });
+        // A text link keeps settings offline; opening Ko-fi remains opt-in.
+        kofiLink.textContent = 'Support the original author on Ko-fi';
 
     }
 }
